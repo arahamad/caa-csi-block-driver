@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"maps"
 	"os"
 	"strconv"
 	"strings"
@@ -93,8 +92,11 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	if !validVolumeID(req.GetName()) {
 		return nil, status.Error(codes.InvalidArgument, "Invalid volume name")
 	}
-	cs.createMu.Lock()
-	defer cs.createMu.Unlock()
+	// Limit serialization to the IBM provisioning path.
+	if req.GetParameters()["cloudProvider"] == "ibmcloud" {
+		cs.createMu.Lock()
+		defer cs.createMu.Unlock()
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, status.FromContextError(err).Err()
 	}
@@ -129,8 +131,7 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	if rec, err := cs.store.Load(req.GetName()); err == nil {
 		// IBM validates canonical settings against the live configuration marker;
 		// aliases/defaults must not be rejected by a raw map comparison first.
-		paramsMatch := rec.Provider == params["cloudProvider"] &&
-			(rec.Provider == "ibmcloud" || sameVolumeParameters(rec.Params, params))
+		paramsMatch := rec.Provider == params["cloudProvider"]
 		if rec.CapacityBytes < capacity || (limit > 0 && rec.CapacityBytes > limit) || !paramsMatch {
 			return nil, status.Errorf(codes.AlreadyExists,
 				"volume %s already exists with incompatible capacity or parameters", req.GetName())
@@ -255,21 +256,6 @@ func (cs *controllerServer) CreateVolume(ctx context.Context, req *csi.CreateVol
 	}
 
 	return &csi.CreateVolumeResponse{Volume: vol}, nil
-}
-
-// Recovery deliberately removes credentials. Compare only volume settings so
-// credential rotation (or their absence from recovered records) is not a conflict.
-func sameVolumeParameters(a, b map[string]string) bool {
-	normalize := func(params map[string]string) map[string]string {
-		out := sanitizePersistableParams(params)
-		for key, value := range out {
-			if value == "" {
-				delete(out, key)
-			}
-		}
-		return out
-	}
-	return maps.Equal(normalize(a), normalize(b))
 }
 
 func provisioningError(operation string, err error) error {
