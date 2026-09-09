@@ -320,13 +320,13 @@ func TestResourceGroupDefault(t *testing.T) {
 		}
 		s := &fakeSession{}
 		p := &IBMCloudProvider{session: s, config: cfg}
-		if _, err := p.CreateVolume("pvc-test", 20*gib); err != nil {
+		if _, err := p.CreateVolume(context.TODO(), "pvc-test", 20*gib); err != nil {
 			t.Fatal(err)
 		}
 		if s.volumes[0].ResourceGroup.ID != want {
 			t.Fatal("resolved group not sent to SDK")
 		}
-		if err := p.DeleteVolume("pvc-test"); err != nil {
+		if err := p.DeleteVolume(context.TODO(), "pvc-test"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -355,7 +355,7 @@ func TestSDPCreateRetryRecoveryAndDelete(t *testing.T) {
 			}
 			s := &fakeSession{}
 			p := &IBMCloudProvider{session: s, config: cfg}
-			first, err := p.CreateVolume("pvc-sdp", size)
+			first, err := p.CreateVolume(context.TODO(), "pvc-sdp", size)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -373,30 +373,30 @@ func TestSDPCreateRetryRecoveryAndDelete(t *testing.T) {
 				v.Iops, v.Bandwidth = &iops, 1000
 			}
 			restarted := &IBMCloudProvider{session: s, config: cfg}
-			second, err := restarted.CreateVolume("pvc-sdp", size)
+			second, err := restarted.CreateVolume(context.TODO(), "pvc-sdp", size)
 			if err != nil || !reflect.DeepEqual(first, second) || s.creates != 1 {
 				t.Fatalf("SDP retry: %+v %v", second, err)
 			}
-			if recovered, err := restarted.ListManagedVolumes(); err != nil || len(recovered) != 1 {
+			if recovered, err := restarted.ListManagedVolumes(context.TODO()); err != nil || len(recovered) != 1 {
 				t.Fatalf("SDP recovery: %+v %v", recovered, err)
 			}
 			if explicit {
 				v.Bandwidth++
-				if _, err := restarted.CreateVolume("pvc-sdp", size); !errors.Is(err, caa.ErrVolumeAlreadyExists) {
+				if _, err := restarted.CreateVolume(context.TODO(), "pvc-sdp", size); !errors.Is(err, caa.ErrVolumeAlreadyExists) {
 					t.Fatalf("throughput mismatch accepted: %v", err)
 				}
 				v.Bandwidth--
 				wrongIOPS := "4000"
 				v.Iops = &wrongIOPS
-				if _, err := restarted.CreateVolume("pvc-sdp", size); !errors.Is(err, caa.ErrVolumeAlreadyExists) {
+				if _, err := restarted.CreateVolume(context.TODO(), "pvc-sdp", size); !errors.Is(err, caa.ErrVolumeAlreadyExists) {
 					t.Fatalf("IOPS mismatch accepted: %v", err)
 				}
 				v.Iops = &cfg.Iops
 			}
-			if err := restarted.DeleteVolume("pvc-sdp"); err != nil {
+			if err := restarted.DeleteVolume(context.TODO(), "pvc-sdp"); err != nil {
 				t.Fatal(err)
 			}
-			if err := restarted.DeleteVolume("pvc-sdp"); err != nil || s.deletes != 1 {
+			if err := restarted.DeleteVolume(context.TODO(), "pvc-sdp"); err != nil || s.deletes != 1 {
 				t.Fatalf("SDP delete retry: %v", err)
 			}
 		})
@@ -411,11 +411,11 @@ func TestExistingConfigurationTagUnchanged(t *testing.T) {
 	if p.configTag() != want {
 		t.Fatal("adding SDP changed existing configuration tags")
 	}
-	if _, err := p.CreateVolume("pvc-test", 20*gib); err != nil {
+	if _, err := p.CreateVolume(context.TODO(), "pvc-test", 20*gib); err != nil {
 		t.Fatal(err)
 	}
 	s.volumes[0].Tags = []string{ownershipTagPrefix + "pvc-test", want}
-	if err := p.DeleteVolume("pvc-test"); err != nil {
+	if err := p.DeleteVolume(context.TODO(), "pvc-test"); err != nil {
 		t.Fatalf("legacy volume deletion: %v", err)
 	}
 }
