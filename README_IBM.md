@@ -53,16 +53,20 @@ The provider supports both the standard Kubernetes-SIG community keys and an alt
 
 | Key | Description | Example / Default |
 | --- | --- | --- |
-| `profile` / `ibmProfile` | VPC Storage Profile to use | `"general-purpose"`, `"custom"`, `"10iops-tier"` |
+| `profile` / `ibmProfile` | VPC Storage Profile to use | `"general-purpose"`, `"5iops-tier"`, `"10iops-tier"`, `"custom"`, `"sdp"` |
 | `region` / `ibmRegion` | IBM Cloud region where volumes are provisioned | `"us-south"` |
 | `zone` / `ibmZone` | IBM Cloud Availability Zone | `"us-south-1"` |
-| `resourceGroup` / `ibmResourceGroup` | Resource Group ID for VPC volumes | `"your-resource-group-id"` |
-| `iops` / `ibmIops` | Custom IOPS rate (only used with `"custom"` profile) | `"3000"` |
+| `resourceGroup` / `ibmResourceGroup` | Optional Resource Group ID override | Provider-configured group when omitted |
+| `iops` / `ibmIops` | Optional IOPS for `custom` or `sdp`; ignored for tiered profiles as upstream does | `"3000"`; omitted values use SDK/API behavior |
+| `throughput` | Requested bandwidth in Mbps (for `sdp`), passed as SDK `Bandwidth` | `"2000"`; omitted uses cloud defaults |
 | `billingType` | Billing policy | `"hourly"` (default) or `"monthly"` |
 | `encrypted` | Enable Key Protect / Hyper Protect encryption | `"true"` or `"false"` |
 | `encryptionKey` | CRN of Key Protect key | `"crn:v1:bluemix:public:kms:..."` |
 | `tags` | Comma-separated list of tags to append to the volume | `"confidential,caa-csi"` |
 | `csi.storage.k8s.io/fstype` | Default filesystem used | `"ext4"` (default) or `"xfs"` |
+
+SDP volumes can start at 1 GiB. Other profiles require at least 10 GiB. The IBM
+VPC provider validates supported profile, capacity, IOPS, and throughput combinations.
 
 ---
 
@@ -77,17 +81,15 @@ kubectl apply -f deploy/rbac.yaml
 kubectl apply -f deploy/csi-driver.yaml
 ```
 
-> **Note**: The driver dynamically reads its IAM API keys and configuration from the cluster's default `storage-secret-store` secret (mounted at `/etc/storage_ibmc/` via the `SECRET_CONFIG_PATH` environment variable). Ensure that this secret is present in the `caa-csi-block` namespace, or copy/replicate it over from your cluster's `kube-system` namespace if needed:
->
-> ```bash
-> # Copy storage-secret-store from kube-system to caa-csi-block namespace
-> kubectl get secret storage-secret-store -n kube-system -o yaml | \
->   sed 's/namespace: kube-system/namespace: caa-csi-block/' | \
->   kubectl apply -f -
-> ```
+> The DaemonSet expects IBM authentication configuration in the
+> `caa-csi-block` namespace. Kubernetes service accounts and secrets are
+> namespace-scoped, so resources from `kube-system` are not reused automatically.
+> Ensure the IBM IAM trusted profile authorizes
+> `system:serviceaccount:caa-csi-block:caa-csi-provisioner`, and that both
+> `storage-secret-store` and `cluster-info` exist in `caa-csi-block` before deploying.
 
 ### Step 2: Deploy the DaemonSet
-Update `deploy/daemonset-ibmcloud.yaml` to point to the built driver image that you pushed in Step 2, then deploy it:
+Update `deploy/daemonset-ibmcloud.yaml` to point to the built driver image, then deploy it:
 
 ```bash
 kubectl apply -f deploy/daemonset-ibmcloud.yaml
@@ -104,7 +106,8 @@ kubectl apply -f deploy/storageclass-ibmcloud.yaml
 
 ## 5. Verifying & Testing
 
-Create a test PVC and map it to a sandboxed PeerPod to verify that volume creation, publishing, mounting, and deletion occur flawlessly.
+Create a test PVC and map it to a sandboxed PeerPod to verify volume creation,
+publishing, mounting, and deletion.
 
 Save the following as `test-pvc-pod.yaml`:
 
@@ -118,7 +121,7 @@ spec:
   accessModes: [ReadWriteOnce]
   resources:
     requests:
-      storage: 10Gi # Minimum supported VPC Block size is 10GiB
+      storage: 10Gi # Minimum supported VPC Block size for non-SDP profiles
   storageClassName: caa-csi-ibmcloud
 ---
 apiVersion: v1
@@ -153,9 +156,9 @@ Check the status of the volume and pod:
 # Verify the PVC status goes to 'Bound'
 kubectl get pvc ibmcloud-test-pvc
 
-# Verify that the caa-csi-block-plugin controller logs volume creation
+# Verify the driver logs volume creation
 kubectl logs -n caa-csi-block -l app=caa-csi-block -c caa-csi-block-driver
 
-# Verify the pod goes to 'Running' (attached directly to the PodVM)
+# Verify the pod goes to 'Running' with the PeerPod runtime
 kubectl get pod ibmcloud-test-pod
 ```
