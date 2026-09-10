@@ -129,7 +129,7 @@ func cleanStaleMountInfoDirs(rootDir string) {
 	}
 }
 
-func (ns *nodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing")
@@ -157,7 +157,7 @@ func (ns *nodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 		}
 	}
 
-	volInfo, err := p.CreateVolume(volumeID, sizeBytes)
+	volInfo, err := p.CreateVolume(ctx, volumeID, sizeBytes)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "provider.CreateVolume failed: %v", err)
 	}
