@@ -17,6 +17,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/IBM/ibmcloud-volume-interface/lib/provider"
+	providerError "github.com/IBM/ibmcloud-volume-interface/lib/utils"
 	cloudProvider "github.com/IBM/ibmcloud-volume-vpc/pkg/ibmcloudprovider"
 	k8sUtils "github.com/IBM/secret-utils-lib/pkg/k8s_utils"
 
@@ -50,6 +51,7 @@ type Config struct {
 	ExtraTags     []string // User-supplied extra tags
 	FsType        string   // e.g., "ext4"
 	Throughput    int32    `json:",omitempty"` // Mbps; omit zero to preserve existing configuration tags
+	VolumeID      string   `json:",omitempty"` // Pre-resolved volume ID from context
 }
 
 // IBMCloudProvider manages VPC block volumes using the official community ibmcloud-volume-vpc SDK.
@@ -108,6 +110,11 @@ func parseConfig(params map[string]string) (Config, error) {
 		}
 	}
 
+	volumeID := params["ibm-volume-id"]
+	if volumeID == "" {
+		volumeID = params["cloud-volume-path"]
+	}
+
 	cfg := Config{
 		Region:        region,
 		Zone:          zone,
@@ -119,6 +126,7 @@ func parseConfig(params map[string]string) (Config, error) {
 		BillingType:   params["billingType"],
 		ExtraTags:     extraTags,
 		FsType:        params["csi.storage.k8s.io/fstype"],
+		VolumeID:      volumeID,
 	}
 	if cfg.Region == "" || cfg.Zone == "" {
 		return Config{}, fmt.Errorf("region and zone must be explicitly configured")
@@ -188,9 +196,10 @@ func newProviderWithConfig(cfg Config) (*IBMCloudProvider, error) {
 	}
 	// The SDK requires a resource group in its request. Upstream defaults it
 	// from this same provider configuration when the StorageClass omits it.
-	cfg.ResourceGroup, err = resolveResourceGroup(cfg.ResourceGroup, storageProvider.GetConfig().VPC.G2ResourceGroupID)
-	if err != nil {
-		return nil, err
+	var errRG error
+	cfg.ResourceGroup, errRG = resolveResourceGroup(cfg.ResourceGroup, storageProvider.GetConfig().VPC.G2ResourceGroupID)
+	if errRG != nil {
+		return nil, errRG
 	}
 
 	// Retrieve the active VPC Storage Provider Session
@@ -220,7 +229,13 @@ func resolveResourceGroup(explicit, configured string) (string, error) {
 
 // CreateVolume provisions a new VPC Block Volume using the ibmcloud-volume-vpc SDK.
 func (p *IBMCloudProvider) CreateVolume(ctx context.Context, volumeID string, sizeBytes int64) (*caaProvider.VolumeInfo, error) {
-	// Configuration is checked at construction; lookupVolume checks the name.
+	if p.config.Zone == "" {
+		return nil, fmt.Errorf("zone (or ibmZone) parameter is required to create a new volume")
+	}
+
+	if volumeID == "" {
+		return nil, fmt.Errorf("%w: empty volume name", caaProvider.ErrInvalidParameters)
+	}
 	allocated, err := p.NormalizeCapacity(sizeBytes)
 	if err != nil {
 		return nil, err
@@ -253,11 +268,10 @@ func (p *IBMCloudProvider) CreateVolume(ctx context.Context, volumeID string, si
 
 	// Create volume request payload using community structures
 	volRequest := provider.Volume{
-		Name:        &volumeID,
-		Capacity:    &sizeGB,
-		Az:          p.config.Zone,
-		Region:      p.config.Region,
-		BillingType: p.config.BillingType,
+		Name:     &volumeID,
+		Capacity: &sizeGB,
+		Az:       p.config.Zone,
+		Region:   p.config.Region,
 		VPCVolume: provider.VPCVolume{
 			Bandwidth: p.config.Throughput,
 			Profile: &provider.Profile{
@@ -404,6 +418,20 @@ func (p *IBMCloudProvider) NormalizeCapacity(sizeBytes int64) (int64, error) {
 // List-by-name returns an empty collection for absence, unlike GetVolumeByName
 // whose SDK error wrapping obscures not-found versus authorization/transport errors.
 func (p *IBMCloudProvider) lookupVolume(ctx context.Context, name string) (*provider.Volume, error) {
+	if p.config.VolumeID != "" {
+		volume, err := p.session.GetVolume(p.config.VolumeID)
+		if err == nil {
+			if volume != nil && volume.Name == nil {
+				volume.Name = &name
+			}
+			return volume, nil
+		}
+		if isNotFound(err) {
+			return nil, fmt.Errorf("%w: %s", caaProvider.ErrVolumeNotFound, name)
+		}
+		logger.Printf("Warning: failed to GetVolume %s, falling back to name lookup: %v", p.config.VolumeID, err)
+	}
+
 	if name == "" {
 		return nil, fmt.Errorf("%w: empty volume name", caaProvider.ErrInvalidParameters)
 	}
@@ -436,6 +464,17 @@ func (p *IBMCloudProvider) lookupVolume(ctx context.Context, name string) (*prov
 		return nil, fmt.Errorf("%w: %s", caaProvider.ErrVolumeNotFound, name)
 	}
 	return found, nil
+}
+
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if providerError.GetErrorType(err) == providerError.EntityNotFound {
+		return true
+	}
+	var message providerError.Message
+	return errors.As(err, &message) && message.RC == 404
 }
 
 func (p *IBMCloudProvider) listVolumes(ctx context.Context, filters map[string]string) ([]*provider.Volume, error) {
