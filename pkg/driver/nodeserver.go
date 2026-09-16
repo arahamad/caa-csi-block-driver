@@ -59,16 +59,76 @@ type nodeServer struct {
 	nodeID  string
 	mu      sync.Mutex
 	devices map[string]string // volumeID → device path or cloud volume ID
+	topo    *csi.Topology
 }
 
 func newNodeServer(nodeID string) *nodeServer {
-	return &nodeServer{
+	ns := &nodeServer{
 		nodeID:  nodeID,
 		devices: make(map[string]string),
 	}
+	cleanStaleMountInfoDirs(getKataDirectVolumeRootPath())
+	return ns
 }
 
-func (ns *nodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+// cleanStaleMountInfoDirs removes leftover mountInfo.json directories that
+// survived a node restart (i.e. NodeUnpublishVolume never ran). Each dir
+// name is base64(targetPath); if the targetPath no longer exists on disk
+// the dir is stale and safe to remove. Corrupt mountInfo.json files are
+// also cleaned up.
+func cleanStaleMountInfoDirs(rootDir string) {
+	entries, err := os.ReadDir(rootDir)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		decodedBytes, err := b64.URLEncoding.DecodeString(entry.Name())
+		if err != nil {
+			continue
+		}
+		targetPath := string(decodedBytes)
+
+		dirPath := filepath.Join(rootDir, entry.Name())
+		infoPath := filepath.Join(dirPath, mountInfoFileName)
+
+		data, err := os.ReadFile(infoPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			nsLogger.Printf("startup cleanup: skipping %s, cannot read mountInfo: %v", entry.Name(), err)
+			continue
+		}
+
+		var info mountInfoJSON
+		if err := json.Unmarshal(data, &info); err != nil {
+			nsLogger.Printf("startup cleanup: removing corrupt mountInfo dir %s: %v", entry.Name(), err)
+			if err := os.RemoveAll(dirPath); err != nil {
+				nsLogger.Printf("startup cleanup: failed to remove %s: %v", dirPath, err)
+			}
+			continue
+		}
+
+		if _, err := os.Stat(targetPath); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			nsLogger.Printf("startup cleanup: skipping %s, cannot stat target: %v", targetPath, err)
+			continue
+		}
+
+		nsLogger.Printf("startup cleanup: removing stale mountInfo dir for %s (target path gone)", targetPath)
+		if err := os.RemoveAll(dirPath); err != nil {
+			nsLogger.Printf("startup cleanup: failed to remove %s: %v", dirPath, err)
+		}
+	}
+}
+
+func (ns *nodeServer) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	if volumeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing")
@@ -96,7 +156,7 @@ func (ns *nodeServer) NodeStageVolume(_ context.Context, req *csi.NodeStageVolum
 		}
 	}
 
-	volInfo, err := p.CreateVolume(volumeID, sizeBytes)
+	volInfo, err := p.CreateVolume(ctx, volumeID, sizeBytes)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "provider.CreateVolume failed: %v", err)
 	}
@@ -377,24 +437,28 @@ func (ns *nodeServer) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapab
 	}, nil
 }
 
-func (ns *nodeServer) NodeGetInfo(_ context.Context, _ *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
-	resp := &csi.NodeGetInfoResponse{
-		NodeId: ns.nodeID,
+func (ns *nodeServer) NodeGetInfo(ctx context.Context, _ *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
+	ns.mu.Lock()
+	topo := ns.topo
+	ns.mu.Unlock()
+
+	if topo == nil {
+		topo = resolveNodeTopology(ctx, ns.nodeID)
+		if topo == nil {
+			return nil, status.Error(codes.Unavailable, "node topology not yet available")
+		}
+		ns.mu.Lock()
+		if ns.topo == nil {
+			ns.topo = topo
+			nsLogger.Printf("NodeGetInfo: advertising topology segments: %v", topo.Segments)
+		} else {
+			topo = ns.topo
+		}
+		ns.mu.Unlock()
 	}
 
-	region := os.Getenv("CSI_TOPOLOGY_REGION")
-	zone := os.Getenv("CSI_TOPOLOGY_ZONE")
-	if region != "" || zone != "" {
-		segments := make(map[string]string)
-		if region != "" {
-			segments["topology.caa-csi.io/region"] = region
-		}
-		if zone != "" {
-			segments["topology.caa-csi.io/zone"] = zone
-		}
-		resp.AccessibleTopology = &csi.Topology{Segments: segments}
-		nsLogger.Printf("NodeGetInfo: advertising topology segments: %v", segments)
-	}
-
-	return resp, nil
+	return &csi.NodeGetInfoResponse{
+		NodeId:             ns.nodeID,
+		AccessibleTopology: topo,
+	}, nil
 }
